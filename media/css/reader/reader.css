@@ -1862,10 +1862,11 @@ hr {
 }
 .NB-story-title .NB-storytitles-sentiment {
     position: absolute;
-    width: 24px;
-    height: 20px;
     left: 0;
     top: 2px;
+    border-radius: 16px;
+    width: 10px;
+    height: 10px;
 }
 .NB-story-pane-west .NB-story-title .NB-storytitles-sentiment {
     left: 4px;
@@ -1889,8 +1890,13 @@ hr {
 }
 
 .NB-story-title.NB-story-neutral .NB-storytitles-sentiment {
-    background: transparent url('/media/embed/icons/circular/g_icn_unread.png') no-repeat 13px 6px;
-    background-size: 8px;
+    box-shadow: 0 1px 1px rgb(0 0 0 / 10%);
+    border: 1px solid rgba(0 0 0 / 10%);
+    background-image: linear-gradient( 180deg,   
+    hsl(80deg 6% 80%) 0%,
+    hsl(77deg 5% 69%) 50%,
+    hsl(73deg 4% 58%) 100%
+    );
 }
 
 .NB-story-title.NB-story-negative .NB-storytitles-sentiment {
