@@ -3,6 +3,7 @@ import time
 import re
 import redis
 import pymongo
+import mongoengine as mongo
 from operator import itemgetter
 from pprint import pprint
 from utils import log as logging
@@ -123,10 +124,10 @@ class UserSubscription(models.Model):
             feed_ids = [sub.feed_id for sub in usersubs]
             if not feed_ids:
                 return story_hashes
-        
+
         current_time = int(time.time() + 60*60*24)
         if not cutoff_date:
-            cutoff_date = datetime.datetime.now() - datetime.timedelta(days=settings.DAYS_OF_STORY_HASHES)
+            cutoff_date = datetime.datetime.now() - datetime.timedelta(days=UserSubscription.days_of_story_hashes_for_user(user_id))
         feed_counter = 0
 
         read_dates = dict()
@@ -214,14 +215,16 @@ class UserSubscription(models.Model):
                 pipeline.execute()
                 r.delete(unread_ranked_stories_key)
         
-        current_time = int(time.time() + 60*60*24)
         if not cutoff_date:
-            cutoff_date = datetime.datetime.now() - datetime.timedelta(days=settings.DAYS_OF_UNREAD)
             if read_filter == "unread":
+                cutoff_date = datetime.datetime.now() - datetime.timedelta(days=self.user.profile.days_of_unread)
                 cutoff_date = max(cutoff_date, self.mark_read_date)
+            elif read_filter == "all":
+                cutoff_date = datetime.datetime.now() - datetime.timedelta(days=self.user.profile.days_of_story_hashes)
             elif default_cutoff_date:
                 cutoff_date = default_cutoff_date
 
+        current_time = int(time.time() + 60*60*24)
         if order == 'oldest':
             byscorefunc = rt.zrangebyscore
             if read_filter == 'unread':
@@ -333,6 +336,11 @@ class UserSubscription(models.Model):
         rt.expire(unread_ranked_stories_keys, 60*60)
         
         return story_hashes, unread_feed_story_hashes
+    
+    @classmethod
+    def days_of_story_hashes_for_user(cls, user_id):
+        user = User.objects.get(pk=user_id)
+        return user.profile.days_of_story_hashes
     
     @classmethod
     def truncate_river(cls, user_id, feed_ids, read_filter, cache_prefix=""):
@@ -704,9 +712,20 @@ class UserSubscription(models.Model):
     
     def invert_read_stories_after_unread_story(self, story, request=None):
         data = dict(code=1)
-        if story.story_date > self.mark_read_date: 
+        if story.story_date > self.mark_read_date:
             return data
-            
+
+        # Check if user is archive and story is outside unread cutoff
+        if self.user.profile.is_archive and story.story_date < self.user.profile.unread_cutoff:
+            user_unread_story = MUserUnreadStory.mark_unread(
+                user_id=self.user_id,
+                feed_id=story.story_feed_id,
+                story_hash=story.story_hash,
+                story_date=story.story_date,
+            )
+            data['story_hashes'] = [story.story_hash]
+            return data
+        
         # Story is outside the mark as read range, so invert all stories before.
         newer_stories = MStory.objects(story_feed_id=story.story_feed_id,
                                        story_date__gte=story.story_date,
@@ -994,10 +1013,10 @@ class UserSubscription(models.Model):
 
         if not safety_net: return
 
-        logging.user(user, "~FBFound ~FR%s unscheduled feeds~FB, scheduling..." % len(safety_net))
+        logging.user(user, "~FBFound ~FR%s unscheduled feeds~FB, scheduling immediately..." % len(safety_net))
         for feed_id in safety_net:
             feed = Feed.get_by_id(feed_id)
-            feed.set_next_scheduled_update()
+            feed.schedule_feed_fetch_immediately()
 
     @classmethod
     def count_subscribers_to_other_subscriptions(cls, feed_id):
@@ -1051,11 +1070,8 @@ class RUserStory:
         ps = redis.Redis(connection_pool=settings.REDIS_PUBSUB_POOL)
         if not username:
             username = User.objects.get(pk=user_id).username
-        # if not r2:
-        #     r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
         
         p = r.pipeline()
-        # p2 = r2.pipeline()
         feed_ids = set()
         friend_ids = set()
         
@@ -1079,7 +1095,6 @@ class RUserStory:
             cls.mark_read(user_id, feed_id, story_hash, social_user_ids=friends_with_shares, r=p, username=username, ps=ps)
         
         p.execute()
-        # p2.execute()
         
         return list(feed_ids), list(friend_ids)
 
@@ -1091,8 +1106,6 @@ class RUserStory:
             s = redis.Redis(connection_pool=settings.REDIS_POOL)
         if not ps:
             ps = redis.Redis(connection_pool=settings.REDIS_PUBSUB_POOL)
-        # if not r2:
-        #     r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
         
         friend_ids = set()
         feed_id, _ = MStory.split_story_hash(story_hash)
@@ -1118,6 +1131,8 @@ class RUserStory:
         feed_read_key = "fR:%s:%s" % (feed_id, week_of_year)
         
         r.incr(feed_read_key)
+        # This settings.DAYS_OF_STORY_HASHES doesn't need to consider potential pro subscribers
+        # because the feed_read_key is really only used for statistics and not unreads
         r.expire(feed_read_key, 2*settings.DAYS_OF_STORY_HASHES*24*60*60)
         
     @classmethod
@@ -1125,8 +1140,6 @@ class RUserStory:
                   aggregated=False, r=None, username=None, ps=None):
         if not r:
             r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # if not r2:
-        #     r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
         
         story_hash = MStory.ensure_story_hash(story_hash, story_feed_id=story_feed_id)
 
@@ -1134,9 +1147,7 @@ class RUserStory:
         
         def redis_commands(key):
             r.sadd(key, story_hash)
-            # r2.sadd(key, story_hash)
-            r.expire(key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-            # r2.expire(key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            r.expire(key, Feed.days_of_story_hashes_for_feed(story_feed_id)*24*60*60)
 
         all_read_stories_key = 'RS:%s' % (user_id)
         redis_commands(all_read_stories_key)
@@ -1156,20 +1167,23 @@ class RUserStory:
             key = 'lRS:%s' % user_id
             r.lpush(key, story_hash)
             r.ltrim(key, 0, 1000)
-            r.expire(key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            r.expire(key, Feed.days_of_story_hashes_for_feed(story_feed_id)*24*60*60)
     
     @staticmethod
-    def story_can_be_marked_read_by_user(story, user):
+    def story_can_be_marked_unread_by_user(story, user):
         message = None
-        if story.story_date < user.profile.unread_cutoff:
+        if story.story_date < user.profile.unread_cutoff and not user.profile.is_archive:
+            # if user.profile.is_archive:
+            #     message = "Story is more than %s days old, change your days of unreads under Preferences." % (
+            #               user.profile.days_of_unread)
             if user.profile.is_premium:
-                message = "Story is more than %s days old, cannot mark as unread." % (
+                message = "Story is more than %s days old. Premium Archive accounts can mark any story as unread." % (
                           settings.DAYS_OF_UNREAD)
             elif story.story_date > user.profile.unread_cutoff_premium:
-                message = "Story is more than %s days old. Premiums can mark unread up to 30 days." % (
-                          settings.DAYS_OF_UNREAD_FREE)
+                message = "Story is older than %s days. Premium has %s days, and Premium Archive can mark anything unread." % (
+                          settings.DAYS_OF_UNREAD_FREE, settings.DAYS_OF_UNREAD)
             else:
-                message = "Story is more than %s days old, cannot mark as unread." % (
+                message = "Story is more than %s days old, only Premium Archive can mark older stories unread." % (
                           settings.DAYS_OF_UNREAD_FREE)
         return message
         
@@ -1177,7 +1191,6 @@ class RUserStory:
     def mark_unread(user_id, story_feed_id, story_hash, social_user_ids=None, r=None, username=None, ps=None):
         if not r:
             r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-            # r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
 
         story_hash = MStory.ensure_story_hash(story_hash, story_feed_id=story_feed_id)
         
@@ -1185,9 +1198,7 @@ class RUserStory:
         
         def redis_commands(key):
             r.srem(key, story_hash)
-            # r2.srem(key, story_hash)
-            r.expire(key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-            # r2.expire(key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            r.expire(key, Feed.days_of_story_hashes_for_feed(story_feed_id)*24*60*60)
 
         all_read_stories_key = 'RS:%s' % (user_id)
         redis_commands(all_read_stories_key)
@@ -1231,9 +1242,7 @@ class RUserStory:
     @classmethod
     def switch_feed(cls, user_id, old_feed_id, new_feed_id):
         r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
         p = r.pipeline()
-        # p2 = r2.pipeline()
         story_hashes = cls.get_stories(user_id, old_feed_id, r=r)
         
         for story_hash in story_hashes:
@@ -1241,18 +1250,13 @@ class RUserStory:
             new_story_hash = "%s:%s" % (new_feed_id, hash_story)
             read_feed_key = "RS:%s:%s" % (user_id, new_feed_id)
             p.sadd(read_feed_key, new_story_hash)
-            # p2.sadd(read_feed_key, new_story_hash)
-            p.expire(read_feed_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-            # p2.expire(read_feed_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            p.expire(read_feed_key, Feed.days_of_story_hashes_for_feed(new_feed_id)*24*60*60)
 
             read_user_key = "RS:%s" % (user_id)
             p.sadd(read_user_key, new_story_hash)
-            # p2.sadd(read_user_key, new_story_hash)
-            p.expire(read_user_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-            # p2.expire(read_user_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            p.expire(read_user_key, Feed.days_of_story_hashes_for_feed(new_feed_id)*24*60*60)
         
         p.execute()
-        # p2.execute()
         
         if len(story_hashes) > 0:
             logging.info(" ---> %s read stories" % len(story_hashes))
@@ -1260,9 +1264,7 @@ class RUserStory:
     @classmethod
     def switch_hash(cls, feed, old_hash, new_hash):
         r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
         p = r.pipeline()
-        # p2 = r2.pipeline()
         
         usersubs = UserSubscription.objects.filter(feed_id=feed.pk, last_read_date__gte=feed.unread_cutoff)
         logging.info(" ---> ~SB%s usersubs~SN to switch read story hashes..." % len(usersubs))
@@ -1271,18 +1273,13 @@ class RUserStory:
             read = r.sismember(rs_key, old_hash)
             if read:
                 p.sadd(rs_key, new_hash)
-                # p2.sadd(rs_key, new_hash)
-                p.expire(rs_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-                # p2.expire(rs_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+                p.expire(rs_key, feed.days_of_story_hashes*24*60*60)
                 
                 read_user_key = "RS:%s" % sub.user.pk
                 p.sadd(read_user_key, new_hash)
-                # p2.sadd(read_user_key, new_hash)
-                p.expire(read_user_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-                # p2.expire(read_user_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+                p.expire(read_user_key, feed.days_of_story_hashes*24*60*60)
         
         p.execute()
-        # p2.execute()
     
     @classmethod
     def read_story_count(cls, user_id):
@@ -1733,3 +1730,40 @@ class Feature(models.Model):
     
     class Meta:
         ordering = ["-date"]
+
+class MUserUnreadStory(mongo.Document):
+    """Model to store manually unread stories that are older than a user's unread_cutoff 
+    (same as days_of_unread). This is built for Premium Archive purposes.
+
+    If a story is marked as unread but is within the unread_cutoff, no need to add a 
+    UserUnreadStory instance as it will be automatically marked as read according to
+    the user's days_of_unread preference.
+    """
+    user_id = mongo.IntField()
+    feed_id = mongo.IntField()
+    story_hash = mongo.StringField(max_length=12)
+    story_date = mongo.DateTimeField()
+    unread_date = mongo.DateTimeField(default=datetime.datetime.now)
+    
+    meta = {
+        'collection': 'user_unread_story',
+        'allow_inheritance': False,
+        'indexes': ['user_id', 'feed_id', ('user_id', 'story_hash')],
+    }
+    
+    def __str__(self):
+        return "%s unread %s on %s" % (self.user_id, self.story_hash, self.unread_date)
+
+    @classmethod
+    def mark_unread(cls, user_id, feed_id, story_hash, story_date):
+        user_unread_story = cls.objects.create(
+            user_id=user_id, feed_id=feed_id, story_hash=story_hash, story_date=story_date
+        )
+        return user_unread_story
+
+    @classmethod
+    def unreads(cls, user_id, story_hash):
+        if not isinstance(story_hash, list):
+            story_hash = [story_hash]
+        user_unread_stories = cls.objects.filter(user_id=user_id, story_hash__in=story_hash)
+        return user_unread_stories

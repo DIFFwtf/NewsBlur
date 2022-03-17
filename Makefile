@@ -35,14 +35,19 @@ nbup:
 	- RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker compose up -d --build --remove-orphans
 coffee:
 	- coffee -c -w **/*.coffee
-
+migrations:
+	- docker exec -it newsblur_web ./manage.py makemigrations
+makemigration: migrations
+migration: migrations
+migrate:
+	- docker exec -it newsblur_web ./manage.py migrate
 shell:
-	- RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker-compose exec newsblur_web ./manage.py shell_plus
+	- docker exec -it newsblur_web ./manage.py shell_plus
 bash:
-	- RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker-compose exec newsblur_web bash
+	- docker exec -it newsblur_web bash
 # allows user to exec into newsblur_web and use pdb.
 debug:
-	- RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker attach ${newsblur}
+	- docker attach ${newsblur}
 log:
 	- RUNWITHMAKEBUILD=True docker compose logs -f --tail 20 newsblur_web newsblur_node
 logweb: log
@@ -54,7 +59,14 @@ logmongo:
 alllogs: 
 	- RUNWITHMAKEBUILD=True docker compose logs -f --tail 20
 logall: alllogs
-# brings down containers
+mongo:
+	- docker exec -it db_mongo mongo --port 29019
+redis:
+	- docker exec -it db_redis redis-cli -p 6579
+postgres:
+	- docker exec -it db_postgres psql -U newsblur
+stripe:
+	- stripe listen --forward-to localhost/zebra/webhooks/v2/
 down:
 	- RUNWITHMAKEBUILD=True docker compose -f docker-compose.yml -f docker-compose.metrics.yml down
 nbdown: down
@@ -73,10 +85,20 @@ keys:
 	- openssl dhparam -out config/certificates/dhparam-2048.pem 2048
 	- openssl req -x509 -nodes -new -sha256 -days 1024 -newkey rsa:2048 -keyout config/certificates/RootCA.key -out config/certificates/RootCA.pem -subj "/C=US/CN=Example-Root-CA"
 	- openssl x509 -outform pem -in config/certificates/RootCA.pem -out config/certificates/RootCA.crt
-	- openssl req -new -nodes -newkey rsa:2048 -keyout config/certificates/localhost.key -out config/certificates/localhost.csr -subj "/C=US/ST=YourState/L=YourCity/O=Example-Certificates/CN=localhost.local"
+	- openssl req -new -nodes -newkey rsa:2048 -keyout config/certificates/localhost.key -out config/certificates/localhost.csr -subj "/C=US/ST=YourState/L=YourCity/O=Example-Certificates/CN=localhost"
 	- openssl x509 -req -sha256 -days 1024 -in config/certificates/localhost.csr -CA config/certificates/RootCA.pem -CAkey config/certificates/RootCA.key -CAcreateserial -out config/certificates/localhost.crt
 	- cat config/certificates/localhost.crt config/certificates/localhost.key > config/certificates/localhost.pem
-	- /usr/bin/security add-trusted-cert -d -r trustAsRoot -k /Library/Keychains/System.keychain ./config/certificates/RootCA.crt
+	- sudo /usr/bin/security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./config/certificates/RootCA.crt
+
+# Doesn't work yet
+mkcert:
+	- mkdir config/mkcert
+	- docker run -v $(shell pwd)/config/mkcert:/root/.local/share/mkcert brunopadz/mkcert-docker:latest \
+		/bin/sh -c "mkcert -install && \
+		mkcert -cert-file /root/.local/share/mkcert/mkcert.pem \
+		-key-file /root/.local/share/mkcert/mkcert.key localhost"
+	- cat config/mkcert/rootCA.pem config/mkcert/rootCA-key.pem > config/certificates/localhost.pem
+	- sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./config/mkcert/rootCA.pem
 
 # Digital Ocean / Terraform
 list:
@@ -169,7 +191,6 @@ oldfirewall:
 	- ANSIBLE_CONFIG=/srv/newsblur/ansible.old.cfg ansible-playbook ansible/all.yml  -l db --tags firewall
 repairmongo:
 	- sudo docker run -v "/srv/newsblur/docker/volumes/db_mongo:/data/db" mongo:4.0 mongod --repair --dbpath /data/db
-
 
 # performance tests
 perf-cli:

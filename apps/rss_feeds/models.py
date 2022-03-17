@@ -65,6 +65,8 @@ class Feed(models.Model):
     num_subscribers = models.IntegerField(default=-1)
     active_subscribers = models.IntegerField(default=-1, db_index=True)
     premium_subscribers = models.IntegerField(default=-1)
+    archive_subscribers = models.IntegerField(default=0, null=True, blank=True)
+    pro_subscribers = models.IntegerField(default=0, null=True, blank=True)
     active_premium_subscribers = models.IntegerField(default=-1)
     branch_from_feed = models.ForeignKey('Feed', blank=True, null=True, db_index=True, on_delete=models.CASCADE)
     last_update = models.DateTimeField(db_index=True)
@@ -100,13 +102,15 @@ class Feed(models.Model):
         if not self.feed_title:
             self.feed_title = "[Untitled]"
             self.save()
-        return "%s%s: %s - %s/%s/%s" % (
+        return "%s%s: %s - %s/%s/%s/%s/%s" % (
             self.pk, 
             (" [B: %s]" % self.branch_from_feed.pk if self.branch_from_feed else ""),
             self.feed_title, 
             self.num_subscribers,
             self.active_subscribers,
             self.active_premium_subscribers,
+            self.archive_subscribers,
+            self.pro_subscribers,
             )
     
     @property
@@ -134,7 +138,7 @@ class Feed(models.Model):
     def favicon_url_fqdn(self):
         if settings.BACKED_BY_AWS['icons_on_s3'] and self.s3_icon:
             return self.favicon_url
-        return "http://%s%s" % (
+        return "https://%s%s" % (
             Site.objects.get_current().domain,
             self.favicon_url
         )
@@ -149,10 +153,26 @@ class Feed(models.Model):
     
     @property
     def unread_cutoff(self):
-        if self.active_premium_subscribers > 0:
+        if self.archive_subscribers > 0:
+            return datetime.datetime.utcnow() - datetime.timedelta(days=settings.DAYS_OF_UNREAD_ARCHIVE)
+        if self.premium_subscribers > 0:
             return datetime.datetime.utcnow() - datetime.timedelta(days=settings.DAYS_OF_UNREAD)
 
         return datetime.datetime.utcnow() - datetime.timedelta(days=settings.DAYS_OF_UNREAD_FREE)
+    
+    @classmethod
+    def days_of_story_hashes_for_feed(cls, feed_id):
+        try:
+            feed = cls.objects.only('archive_subscribers').get(pk=feed_id)
+            return feed.days_of_story_hashes
+        except cls.DoesNotExist:
+            return settings.DAYS_OF_STORY_HASHES
+    
+    @property
+    def days_of_story_hashes(self):
+        if self.archive_subscribers > 0:
+            return settings.DAYS_OF_STORY_HASHES_ARCHIVE
+        return settings.DAYS_OF_STORY_HASHES
     
     @property
     def story_hashes_in_unread_cutoff(self):
@@ -322,13 +342,9 @@ class Feed(models.Model):
     def expire_redis(self, r=None):
         if not r:
             r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # if not r2:
-            # r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
 
-        r.expire('F:%s' % self.pk, settings.DAYS_OF_STORY_HASHES*24*60*60)
-        # r2.expire('F:%s' % self.pk, settings.DAYS_OF_STORY_HASHES*24*60*60)
-        r.expire('zF:%s' % self.pk, settings.DAYS_OF_STORY_HASHES*24*60*60)
-        # r2.expire('zF:%s' % self.pk, settings.DAYS_OF_STORY_HASHES*24*60*60)
+        r.expire('F:%s' % self.pk, self.days_of_story_hashes*24*60*60)
+        r.expire('zF:%s' % self.pk, self.days_of_story_hashes*24*60*60)
     
     @classmethod
     def low_volume_feeds(cls, feed_ids, stories_per_month=30):
@@ -639,7 +655,8 @@ class Feed(models.Model):
 
     def setup_feed_for_premium_subscribers(self):
         self.count_subscribers()
-        self.set_next_scheduled_update()
+        self.set_next_scheduled_update(verbose=settings.DEBUG)
+        self.sync_redis()
         
     def check_feed_link_for_feed_address(self):
         @timelimit(10)
@@ -707,7 +724,7 @@ class Feed(models.Model):
         if status_code not in (200, 304):
             self.errors_since_good += 1
             self.count_errors_in_history('feed', status_code, fetch_history=fetch_history)
-            self.set_next_scheduled_update()
+            self.set_next_scheduled_update(verbose=settings.DEBUG)
         elif self.has_feed_exception or self.errors_since_good:
             self.errors_since_good = 0
             self.has_feed_exception = False
@@ -792,7 +809,6 @@ class Feed(models.Model):
         total_key = "s:%s" % self.original_feed_id
         premium_key = "sp:%s" % self.original_feed_id
         last_recount = r.zscore(total_key, -1) # Need to subtract this extra when counting subs
-        last_recount = r.zscore(premium_key, -1) # Need to subtract this extra when counting subs
 
         # Check for expired feeds with no active users who would have triggered a cleanup
         if last_recount and last_recount > subscriber_expire:
@@ -816,6 +832,8 @@ class Feed(models.Model):
         total = 0
         active = 0
         premium = 0
+        archive = 0
+        pro = 0
         active_premium = 0
         
         # Include all branched feeds in counts
@@ -831,10 +849,14 @@ class Feed(models.Model):
                 # now+1 ensures `-1` flag will be corrected for later with - 1
                 total_key = "s:%s" % feed_id
                 premium_key = "sp:%s" % feed_id
+                archive_key = "sarchive:%s" % feed_id
+                pro_key = "spro:%s" % feed_id
                 pipeline.zcard(total_key)
                 pipeline.zcount(total_key, subscriber_expire, now+1)
                 pipeline.zcard(premium_key)
                 pipeline.zcount(premium_key, subscriber_expire, now+1)
+                pipeline.zcard(archive_key)
+                pipeline.zcard(pro_key)
 
                 results = pipeline.execute()
             
@@ -843,13 +865,17 @@ class Feed(models.Model):
                 active += max(0, results[1] - 1)
                 premium += max(0, results[2] - 1)
                 active_premium += max(0, results[3] - 1)
+                archive += max(0, results[4] - 1)
+                pro += max(0, results[5] - 1)
                 
             original_num_subscribers = self.num_subscribers
             original_active_subs = self.active_subscribers
             original_premium_subscribers = self.premium_subscribers
             original_active_premium_subscribers = self.active_premium_subscribers
-            logging.info("   ---> [%-30s] ~SN~FBCounting subscribers from ~FCredis~FB: ~FMt:~SB~FM%s~SN a:~SB%s~SN p:~SB%s~SN ap:~SB%s ~SN~FC%s" % 
-                          (self.log_title[:30], total, active, premium, active_premium, "(%s branches)" % (len(feed_ids)-1) if len(feed_ids)>1 else ""))
+            original_archive_subscribers = self.archive_subscribers
+            original_pro_subscribers = self.pro_subscribers
+            logging.info("   ---> [%-30s] ~SN~FBCounting subscribers from ~FCredis~FB: ~FMt:~SB~FM%s~SN a:~SB%s~SN p:~SB%s~SN ap:~SB%s~SN archive:~SB%s~SN pro:~SB%s ~SN~FC%s" % 
+                          (self.log_title[:30], total, active, premium, active_premium, archive, pro, "(%s branches)" % (len(feed_ids)-1) if len(feed_ids)>1 else ""))
         else:
             from apps.reader.models import UserSubscription
             
@@ -872,6 +898,22 @@ class Feed(models.Model):
             )
             original_premium_subscribers = self.premium_subscribers
             premium = premium_subs.count()
+            
+            archive_subs = UserSubscription.objects.filter(
+                feed__in=feed_ids, 
+                active=True,
+                user__profile__is_archive=True
+            )
+            original_archive_subscribers = self.archive_subscribers
+            archive = archive_subs.count()
+        
+            pro_subs = UserSubscription.objects.filter(
+                feed__in=feed_ids, 
+                active=True,
+                user__profile__is_pro=True
+            )
+            original_pro_subscribers = self.pro_subscribers
+            pro = pro_subs.count()
         
             active_premium_subscribers = UserSubscription.objects.filter(
                 feed__in=feed_ids, 
@@ -881,8 +923,8 @@ class Feed(models.Model):
             )
             original_active_premium_subscribers = self.active_premium_subscribers
             active_premium = active_premium_subscribers.count()
-            logging.debug("   ---> [%-30s] ~SN~FBCounting subscribers from ~FYpostgres~FB: ~FMt:~SB~FM%s~SN a:~SB%s~SN p:~SB%s~SN ap:~SB%s" % 
-                          (self.log_title[:30], total, active, premium, active_premium))
+            logging.debug("   ---> [%-30s] ~SN~FBCounting subscribers from ~FYpostgres~FB: ~FMt:~SB~FM%s~SN a:~SB%s~SN p:~SB%s~SN ap:~SB%s~SN archive:~SB%s~SN pro:~SB%s" % 
+                          (self.log_title[:30], total, active, premium, active_premium, archive, pro))
 
         if settings.DOCKERBUILD:
             # Local installs enjoy 100% active feeds
@@ -893,15 +935,20 @@ class Feed(models.Model):
         self.active_subscribers = active
         self.premium_subscribers = premium
         self.active_premium_subscribers = active_premium
+        self.archive_subscribers = archive
+        self.pro_subscribers = pro
         if (self.num_subscribers != original_num_subscribers or
             self.active_subscribers != original_active_subs or
             self.premium_subscribers != original_premium_subscribers or
-            self.active_premium_subscribers != original_active_premium_subscribers):
+            self.active_premium_subscribers != original_active_premium_subscribers or
+            self.archive_subscribers != original_archive_subscribers or
+            self.pro_subscribers != original_pro_subscribers):
             if original_premium_subscribers == -1 or original_active_premium_subscribers == -1:
                 self.save()
             else:
                 self.save(update_fields=['num_subscribers', 'active_subscribers', 
-                                         'premium_subscribers', 'active_premium_subscribers'])
+                                         'premium_subscribers', 'active_premium_subscribers',
+                                         'archive_subscribers', 'pro_subscribers'])
         
         if verbose:
             if self.num_subscribers <= 1:
@@ -1213,7 +1260,7 @@ class Feed(models.Model):
             feed = Feed.get_by_id(feed.pk)
         if feed:
             feed.last_update = datetime.datetime.utcnow()
-            feed.set_next_scheduled_update()
+            feed.set_next_scheduled_update(verbose=settings.DEBUG)
             r.zadd('fetched_feeds_last_hour', { feed.pk: int(datetime.datetime.now().strftime('%s')) })
         
         if not feed or original_feed_id != feed.pk:
@@ -1481,7 +1528,9 @@ class Feed(models.Model):
                 feed = Feed.objects.get(pk=feed_id)
             except Feed.DoesNotExist:
                 continue
-            if feed.active_subscribers <= 0 and (not feed.last_story_date or feed.last_story_date < month_ago):
+            if (feed.active_subscribers <= 0 and 
+                feed.archive_subscribers <= 0 and 
+                (not feed.last_story_date or feed.last_story_date < month_ago)):
                 months_ago = 6
                 if feed.last_story_date:
                     months_ago = int((now - feed.last_story_date).days / 30.0)
@@ -1501,6 +1550,9 @@ class Feed(models.Model):
     
     @property
     def story_cutoff(self):
+        if self.archive_subscribers > 0:
+            return 10000
+        
         cutoff = 500
         if self.active_subscribers <= 0:
             cutoff = 25
@@ -2116,14 +2168,16 @@ class Feed(models.Model):
         #     print 'New/updated story: %s' % (story), 
         return story_in_system, story_has_changed
     
-    def get_next_scheduled_update(self, force=False, verbose=True, premium_speed=False):
+    def get_next_scheduled_update(self, force=False, verbose=True, premium_speed=False, pro_speed=False):
         if self.min_to_decay and not force and not premium_speed:
             return self.min_to_decay
         
         from apps.notifications.models import MUserFeedNotification
-
+        
         if premium_speed:
             self.active_premium_subscribers += 1
+        if pro_speed:
+            self.pro_subscribers += 1
         
         spd  = self.stories_last_month / 30.0
         subs = (self.active_premium_subscribers + 
@@ -2204,13 +2258,22 @@ class Feed(models.Model):
         # Twitter feeds get 2 hours minimum
         if 'twitter' in self.feed_address:
             total = max(total, 60*2)
-                
+        
+        # Pro subscribers get absolute minimum
+        if self.pro_subscribers >= 1:
+            if self.stories_last_month == 0:
+                total = min(total, 60)
+            else:
+                total = min(total, settings.PRO_MINUTES_BETWEEN_FETCHES)
+
         if verbose:
-            logging.debug("   ---> [%-30s] Fetched every %s min - Subs: %s/%s/%s Stories/day: %s" % (
+            logging.debug("   ---> [%-30s] Fetched every %s min - Subs: %s/%s/%s/%s/%s Stories/day: %s" % (
                                                 self.log_title[:30], total, 
                                                 self.num_subscribers,
                                                 self.active_subscribers,
                                                 self.active_premium_subscribers,
+                                                self.archive_subscribers,
+                                                self.pro_subscribers,
                                                 spd))
         return total
         
@@ -2738,52 +2801,36 @@ class MStory(mongo.Document):
     def sync_redis(self, r=None):
         if not r:
             r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # if not r2:
-            # r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
-        UNREAD_CUTOFF = datetime.datetime.now() - datetime.timedelta(days=settings.DAYS_OF_STORY_HASHES)
+        feed = Feed.get_by_id(self.story_feed_id)
 
-        if self.id and self.story_date > UNREAD_CUTOFF:
+        if self.id and self.story_date > feed.unread_cutoff:
             feed_key = 'F:%s' % self.story_feed_id
             r.sadd(feed_key, self.story_hash)
-            r.expire(feed_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-            # r2.sadd(feed_key, self.story_hash)
-            # r2.expire(feed_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            r.expire(feed_key, feed.days_of_story_hashes*24*60*60)
             
             r.zadd('z' + feed_key, { self.story_hash: time.mktime(self.story_date.timetuple()) })
-            r.expire('z' + feed_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
-            # r2.zadd('z' + feed_key, self.story_hash, time.mktime(self.story_date.timetuple()))
-            # r2.expire('z' + feed_key, settings.DAYS_OF_STORY_HASHES*24*60*60)
+            r.expire('z' + feed_key, feed.days_of_story_hashes*24*60*60)
     
     def remove_from_redis(self, r=None):
         if not r:
             r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # if not r2:
-        #     r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
         if self.id:
             r.srem('F:%s' % self.story_feed_id, self.story_hash)
-            # r2.srem('F:%s' % self.story_feed_id, self.story_hash)
             r.zrem('zF:%s' % self.story_feed_id, self.story_hash)
-            # r2.zrem('zF:%s' % self.story_feed_id, self.story_hash)
 
     @classmethod
     def sync_feed_redis(cls, story_feed_id):
         r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-        # r2 = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL2)
-        UNREAD_CUTOFF = datetime.datetime.now() - datetime.timedelta(days=settings.DAYS_OF_STORY_HASHES)
         feed = Feed.get_by_id(story_feed_id)
-        stories = cls.objects.filter(story_feed_id=story_feed_id, story_date__gte=UNREAD_CUTOFF)
+        stories = cls.objects.filter(story_feed_id=story_feed_id, story_date__gte=feed.unread_cutoff)
         r.delete('F:%s' % story_feed_id)
-        # r2.delete('F:%s' % story_feed_id)
         r.delete('zF:%s' % story_feed_id)
-        # r2.delete('zF:%s' % story_feed_id)
 
         logging.info("   ---> [%-30s] ~FMSyncing ~SB%s~SN stories to redis" % (feed and feed.log_title[:30] or story_feed_id, stories.count()))
         p = r.pipeline()
-        # p2 = r2.pipeline()
         for story in stories:
             story.sync_redis(r=p)
         p.execute()
-        # p2.execute()
         
     def count_comments(self):
         from apps.social.models import MSharedStory

@@ -1,6 +1,7 @@
 import stripe
 import requests
 import datetime
+import dateutil
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_protect, csrf_exempt
@@ -34,7 +35,7 @@ from paypal.standard.forms import PayPalPaymentsForm
 
 SINGLE_FIELD_PREFS = ('timezone','feed_pane_size','hide_mobile','send_emails',
                       'hide_getting_started', 'has_setup_feeds', 'has_found_friends',
-                      'has_trained_intelligence')
+                      'has_trained_intelligence', 'days_of_unread')
 SPECIAL_PREFERENCES = ('old_password', 'new_password', 'autofollow_friends', 'dashboard_date',)
 
 @ajax_login_required
@@ -259,7 +260,31 @@ def set_collapsed_folders(request):
     response = dict(code=code)
     return response
 
-@ajax_login_required
+def paypal_webhooks(request):
+    data = json.decode(request.body)
+    logging.user(request, f" ---> {data['event_type']}:")
+    from pprint import pprint; pprint(data)
+    
+    if data['event_type'] in ["BILLING.SUBSCRIPTION.ACTIVATED", "BILLING.SUBSCRIPTION.UPDATED"]:
+        user = User.objects.get(pk=int(data['resource']['custom_id']))
+        user.profile.store_paypal_sub_id(data['resource']['id'])
+        plan_id = data['resource']['plan_id']
+        if plan_id == Profile.plan_to_paypal_plan_id('premium'):
+            user.profile.activate_premium()
+        elif plan_id == Profile.plan_to_paypal_plan_id('archive'):
+            user.profile.activate_archive()
+        elif plan_id == Profile.plan_to_paypal_plan_id('pro'):
+            user.profile.activate_pro()
+        user.profile.cancel_premium_stripe()
+    elif data['event_type'] == "PAYMENT.SALE.COMPLETED":
+        user = User.objects.get(pk=int(data['resource']['custom']))
+        user.profile.setup_premium_history()
+    elif data['event_type'] in ["BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED"]:
+        user = User.objects.get(pk=int(data['resource']['custom_id']))
+        user.profile.setup_premium_history()
+
+    return HttpResponse("OK")
+
 def paypal_form(request):
     domain = Site.objects.get_current().domain
     
@@ -287,11 +312,13 @@ def paypal_form(request):
     # Output the button.
     return HttpResponse(form.render(), content_type='text/html')
 
+@login_required
 def paypal_return(request):
 
     return render(request, 'reader/paypal_return.xhtml', {
+        'user_profile': request.user.profile,
     })
-    
+
 @login_required
 def activate_premium(request):
     return HttpResponseRedirect(reverse('index'))
@@ -471,6 +498,85 @@ def stripe_form(request):
         }
     )
 
+@login_required
+def switch_stripe_subscription(request):
+    plan = request.POST['plan']
+    if plan == "change_stripe":
+        return stripe_checkout(request)
+    elif plan == "change_paypal":
+        paypal_url = request.user.profile.paypal_change_billing_details_url()
+        return HttpResponseRedirect(paypal_url)
+    
+    switch_successful = request.user.profile.switch_stripe_subscription(plan)
+    
+    logging.user(request, "~FCSwitching subscription to ~SB%s~SN~FC (%s)" %(
+        plan,
+        '~FGsucceeded~FC' if switch_successful else '~FRfailed~FC'
+    ))
+    
+    if switch_successful:
+        return HttpResponseRedirect(reverse('stripe-return'))
+    
+    return stripe_checkout(request)
+
+def switch_paypal_subscription(request):
+    plan = request.POST['plan']
+    if plan == "change_stripe":
+        return stripe_checkout(request)
+    elif plan == "change_paypal":
+        paypal_url = request.user.profile.paypal_change_billing_details_url()
+        return HttpResponseRedirect(paypal_url)
+    
+    approve_url = request.user.profile.switch_paypal_subscription_approval_url(plan)
+    
+    logging.user(request, "~FCSwitching subscription to ~SB%s~SN~FC (%s)" %(
+        plan,
+        '~FGsucceeded~FC' if approve_url else '~FRfailed~FC'
+    ))
+    
+    if approve_url:
+        return HttpResponseRedirect(approve_url)
+
+    return HttpResponseRedirect(reverse('paypal-return'))
+
+@login_required
+def stripe_checkout(request):
+    stripe.api_key = settings.STRIPE_SECRET
+    domain = Site.objects.get_current().domain
+    plan = request.POST['plan']
+    
+    if plan == "change_stripe":
+        checkout_session = stripe.billing_portal.Session.create(
+            customer=request.user.profile.stripe_id,
+            return_url="http://%s%s?next=payments" % (domain, reverse('index')),
+        )
+        return HttpResponseRedirect(checkout_session.url, status=303)
+    
+    price = Profile.plan_to_stripe_price(plan)
+    
+    session_dict = {
+        "line_items": [
+            {
+                'price': price,
+                'quantity': 1,
+            },
+        ],
+        "mode": 'subscription',
+        "metadata": {"newsblur_user_id": request.user.pk},
+        "success_url": "http://%s%s" % (domain, reverse('stripe-return')),
+        "cancel_url": "http://%s%s" % (domain, reverse('index')),
+    }
+    if request.user.profile.stripe_id:
+        session_dict['customer'] = request.user.profile.stripe_id
+    else:
+        session_dict["customer_email"] = request.user.email
+
+    checkout_session = stripe.checkout.Session.create(**session_dict)
+
+    logging.user(request, "~BM~FBLoading Stripe checkout")
+
+    return HttpResponseRedirect(checkout_session.url, status=303)
+
 @render_to('reader/activities_module.xhtml')
 def load_activities(request):
     user = get_user(request)
@@ -517,11 +623,37 @@ def payment_history(request):
         }
     }
     
+    next_invoice = None
+    stripe_customer = user.profile.stripe_customer()
+    paypal_api = user.profile.paypal_api()
+    if stripe_customer:
+        try:
+            invoice = stripe.Invoice.upcoming(customer=stripe_customer.id)
+            for lines in invoice.lines.data:
+                next_invoice = dict(payment_date=datetime.datetime.fromtimestamp(lines.period.start), 
+                                    payment_amount=invoice.amount_due/100.0,
+                                    payment_provider="(scheduled)",
+                                    scheduled=True)
+                break
+        except stripe.error.InvalidRequestError:
+            pass
+    
+    if paypal_api and not next_invoice and user.profile.premium_renewal and len(history):
+        next_invoice = dict(payment_date=history[0].payment_date+dateutil.relativedelta.relativedelta(years=1), 
+                            payment_amount=history[0].payment_amount,
+                            payment_provider="(scheduled)",
+                            scheduled=True)
+    
     return {
         'is_premium': user.profile.is_premium,
+        'is_archive': user.profile.is_archive,
+        'is_pro': user.profile.is_pro,
         'premium_expire': user.profile.premium_expire,
+        'premium_renewal': user.profile.premium_renewal,
+        'active_provider': user.profile.active_provider,
         'payments': history,
         'statistics': statistics,
+        'next_invoice': next_invoice,
     }
 
 @ajax_login_required
@@ -539,15 +671,16 @@ def cancel_premium(request):
 def refund_premium(request):
     user_id = request.POST.get('user_id')
     partial = request.POST.get('partial', False)
+    provider = request.POST.get('provider', None)
     user = User.objects.get(pk=user_id)
     try:
-        refunded = user.profile.refund_premium(partial=partial)
+        refunded = user.profile.refund_premium(partial=partial, provider=provider)
     except stripe.error.InvalidRequestError as e:
         refunded = e
     except PayPalAPIResponseError as e:
         refunded = e
 
-    return {'code': 1 if refunded else -1, 'refunded': refunded}
+    return {'code': 1 if type(refunded) == int else -1, 'refunded': refunded}
 
 @staff_member_required
 @ajax_login_required
